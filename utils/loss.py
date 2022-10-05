@@ -132,8 +132,8 @@ class ComputeLoss:
         #wx type(p[1])=<class 'torch.Tensor'>, p[1].shape=torch.Size([BS, 3, 40, 40, 85]), 640 / 16
         #wx type(p[2])=<class 'torch.Tensor'>, p[2].shape=torch.Size([BS, 3, 20, 20, 85]), 640 / 32
         #wx type(targets)=<class 'torch.Tensor'>, targets.shape=torch.Size([objNum, 6])
-        #wx targets.shape[0]代表这个batch图片集中的objects数量
-        #wx targets.shape[1]代表batchNo, cls, xc_relative, yc_relative, w_relative, h_relative
+        #wx targets.shape[0]代表这个batch训练集中的objects数量
+        #wx targets.shape[1]代表image_idx, class_id, xc_normalized, yc_normalized, w_normalized, h_normalized
         #wx type(tcls)=<class 'list'>, len(tcls)=3,
         #wx type(tcls[0])=<class 'torch.Tensor'>, tcls[0].shape=torch.Size([45])
         #wx type(tcls[1])=<class 'torch.Tensor'>, tcls[1].shape=torch.Size([102])
@@ -223,7 +223,14 @@ class ComputeLoss:
 
         return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
 
-    #深度眸 用于计算loss函数所需要的target
+    #wx 分配loss函数计算时所需要的target（参考进击的后浪yolov5深度可视化解析(深度眸)）
+    #####################################################################################################################
+    # 1.将targets复制3遍(3代表anchor数目)，也就是将每个gt bbox复制变成独立的3份，方便和每个位置的3个anchor单独匹配
+    # 2.对每个输出层单独匹配。首先将targets变成anchor尺度，方便计算；然后将target wh shape和anchor的wh计算比例，
+    #   如果比例过大，则说明匹配度不高，将该bbox过滤掉，在当前层认为是bg
+    # 3.计算最近的2个邻居网格
+    # 4.对每个bbox找出对应的正样本anchor，其中包括b表示当前bbox属于batch内部的第几张图片，a表示当前bbox和当前层的第几个anchor匹配上，gi,gj是对应的负责预测该bbox的网格坐标，gxy是不考虑offset或者说yolov3里面设定的该Bbox的负责预测网格，gwh是对应的归一化bbox wh，c是该Bbox类别
+    #####################################################################################################################
     #wx 正负样本分配
     def build_targets(self, p, targets):
         #wx p是特征图, P3/P4/P5, len(p)=3
@@ -233,8 +240,8 @@ class ComputeLoss:
         #wx type(p[2])=<class 'torch.Tensor'>, p[2].shape=torch.Size([BS, 3, 20, 20, 85]), 640 / 32
         #wx type(targets)=<class 'torch.Tensor'>, targets.shape=torch.Size([objs_num, 6])
         #wx targets.shape[0]代表这个batch训练集中的objects数量objs_num
-        #wx targets.shape[1]代表batchNo, cls, xc_relative, yc_relative, w_relative, h_relative
-        #wx batchNo表示这条label信息属于该batch训练集中的第几张图片
+        #wx targets.shape[1]代表image_idx, class_idx, xc_normalized, yc_normalized, w_normalized, h_normalized
+        #wx image_idx表示这条label信息属于该batch训练集中的第几张图片
 
         
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
@@ -243,17 +250,19 @@ class ComputeLoss:
         tcls, tbox, indices, anch, ttars = [], [], [], [], []
         #wx type(gain)=<class 'torch.Tensor'>, gain.shape=torch.Size([7])
         gain = torch.ones(7, device=self.device)  # normalized to gridspace gain
-        #wx type(ai)=<class 'torch.Tensor'>, ai.shape=torch.Size([3, 14])
+        #wx ai表示anchor索引[[0], [1], [2]]，后面有用，用于表示当前bbox和当前层的哪个anchor匹配
+        #wx type(ai)=<class 'torch.Tensor'>, ai.shape=torch.Size([3, objs_num])
         #wx tensor([[0.], [1.], [2.]], device='cuda:0')
         ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
-        #wx targets.repeat(na, 1, 1).shape=torch.Size([3, 14, 6])
-        #wx targets(image, class, xc_relative, yc_relative, w_relative, h_relative, anchor indices)
-        #wx targets.shape=torch.Size([3, 14, 7])
+        #wx 1.将targets复制3遍(3为anchor数目)，也就是将每个gt bbox复制变成独立的3份，方便和每个位置的3个anchor单独匹配，方便后面算Loss
+        #wx targets.repeat(na, 1, 1).shape=torch.Size([3, objs_num, 6])
+        #wx targets(image_idx, class_idx, xc_normalized, yc_normalized, w_normalized, h_normalized, anchor_idx)
+        #wx targets.shape=torch.Size([3, objs_num, 7])
         targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # append anchor indices
 
         g = 0.5  # bias
         #wx off.shape=torch.Size([5, 2])
-        #wx 分别对应中心点、左、上、右、下
+        #wx 分别对应中心点和附近的4个网格(左、上、右、下)
         off = torch.tensor(
             [
                 [0, 0],
@@ -265,55 +274,69 @@ class ComputeLoss:
             ],
             device=self.device).float() * g  # offsets
 
+        #wx 遍历3个输出分支(即P3/P4/P5)
         for i in range(self.nl):
-            #wx self.anchors.shape=torch.Size([3, 3, 2]), (P3/P4/P5, num of anchors, w/h)
+            #wx self.anchors.shape=torch.Size([3, 3, 2]), (P3/P4/P5, anchors_num, w/h)
             #wx p[0].shape=torch.Size([BS, 3, 80, 80, 85])
             #wx p[1].shape=torch.Size([BS, 3, 40, 40, 85])
             #wx p[2].shape=torch.Size([BS, 3, 20, 20, 85])
             anchors, shape = self.anchors[i], p[i].shape
             #wx gain=tensor([ 1.,  1., 80., 80., 80., 80.,  1.], device='cuda:0')
-            #wx gain = [1, 1, 特征图w, 特征图_h, 特征图w, 特征图_h, 1]
+            #wx gain = [1, 1, 特征图_w, 特征图_h, 特征图_w, 特征图_h, 1]
             gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
 
             # Match targets to anchors
-            #wx t.shape=torch.Size([3, objs_num, 7]), targets代表gt
+            #wx targets代表gt，它的xywh本身是归一化尺度，故需要变成特征图尺度；t.shape=torch.Size([3, objs_num, 7])
             t = targets * gain  # shape(3,n,7)
             #wx nt代表这个batchs训练数据的目标个数
             if nt:
-                ipdb.set_trace()
                 # Matches
+                #wx 将gt与anchors进行匹配，确立正样本
+                #wx 主要是把shape和anchor匹配度不高的label去掉，这其实也说明该物体的大小比较极端，要么太大，要么太小，要么wh差距很大
+                #wx 基于shape过滤后，就会出现某些bbox仅仅和当前层的某几个anchor匹配，即可能出现某些bbox仅仅和其中某个匹配，而不是和当前位置所有anchor匹配 
                 #wx anchors.shape=torch.Size([3, 2])，anchors[:, None].shape=torch.Size([3, 1, 2])
                 #wx t[..., 4:6].shape=torch.Size([3, objs_num, 2])
                 #wx r.shape=torch.Size([3, objs_num, 2])
                 #wx t[:, :, 4:6]取到的是gt的宽高
-                #wx 所有的gt的宽高与anchors的宽高计算比例 
+                #wx 计算所有的gt的宽高与anchors的宽高比例 
                 r = t[..., 4:6] / anchors[:, None]  # wh ratio
                 #wx 默认self.hyp['anchor_t']=4，代表target宽高与anchor宽高比例都必须处于1/4到4区间内，才能与当前anchor匹配
-                #wx j.shape=torch.Size([3, 14])
+                #wx 如果最大比例大于预设值model.hyp['anchor_t']=4，则说明当前target和anchor匹配度不高，不应该强制回归，把target丢弃
+                #wx j.shape=torch.Size([3, objs_num])
                 j = torch.max(r, 1 / r).max(2)[0] < self.hyp['anchor_t']  # compare
                 # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
                 #wx t代表保留的gt, 到这里后只保留了能与当前特征图的3个anchors匹配的gt, 每层特征图是3个anchor
-                #wx t.shape=torch.Size([34, 7])
+                #wx t.shape=torch.Size([13, 7])；例如有11个物体，targets.shape为[3, 11, 7]，相当于就有33个gt box，过滤后还剩13个正样本box
                 t = t[j]  # filter
+                ipdb.set_trace()
+
+                # https://www.kaggle.com/c/global-wheat-detection/discussion/172436
+                # 不再是落在哪个网络就计算该网络anchor，而是依靠中心点的情况，选择最接近的2个网格，作为落脚点，可以极大增加正样本数
+                # 也就是对于保留的bbox，最少有3个anchor匹配，最多9个
 
                 # Offsets
-                #wx t各个维度的含义是(image, class, xc_relative, yc_relative, w_relative, h_relative, anchor indices)
+                #wx t各个维度的含义是(image_idx, class_idx, xc, yc, w, h, anchor_idx)
                 gxy = t[:, 2:4]  # grid xy
                 #wx gain = [1, 1, 特征图w, 特征图_h, 特征图w, 特征图_h, 1]
                 gxi = gain[[2, 3]] - gxy  # inverse
+                #wx 这两个条件可以选择出最靠近的2个邻居，加上自己，就是3个网格
                 #wx jklm就分别代表左、上、右、下是否能作为正样本。g=0.5
-                #wx j和l, k和m是互斥的, j.shape=torch.Size([34])
+                #wx j和l, k和m是互斥的, j.shape=torch.Size([13])
                 j, k = ((gxy % 1 < g) & (gxy > 1)).T
                 l, m = ((gxi % 1 < g) & (gxi > 1)).T
-                #wx j.shape=torch.Size([5, 34])
+                #wx j.shape=torch.Size([5, 13])
                 j = torch.stack((torch.ones_like(j), j, k, l, m))
-                #wx 原本一个gt只会存储一份，现在复制成5份
+                #wx 原本一个gt只会存储一份，现在复制成5份，5是因为预设的off是5个，现在选择出最近的3个(包括0,0，也就是自己)
                 t = t.repeat((5, 1, 1))[j]
                 offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
             else:
                 t = targets[0]
                 offsets = 0
 
+            # 按照yolov3，则直接(gxy-0.5).long()即可得到网格坐标
+            # 但是这里考虑了附近网格，故offsets不再是0.5而是2个邻居
+            # 所以xy回归范围也变了，不再是0-1，而是0-2
+            # 宽高范围也不一样了，而是0-4，因为超过4倍比例是算不匹配anchor，所以最大是4
             # Define
             bc, gxy, gwh, a = t.chunk(4, 1)  # (image, class), grid xy, grid wh, anchors
             a, (b, c) = a.long().view(-1), bc.long().T  # anchors, image, class
